@@ -9,10 +9,22 @@ sending messages and commands yourself.
 
 1. Create a virtual environment and install dependencies:
 
+   Windows:
    ```
    python -m venv .venv
    .venv\Scripts\pip install -r requirements.txt
    ```
+
+   Linux:
+   ```
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+
+   On Linux, BLE goes through BlueZ, so make sure `bluez` is installed and
+   `bluetoothd` is running (e.g. `sudo apt install bluez` on Debian/Ubuntu).
+   If BLE scanning fails, `bluetoothctl` is the first place to check that
+   the adapter is up and not blocked.
 
 2. Copy `config.example.json` to `config.json` (the latter is gitignored
    since it holds your specific device's address).
@@ -26,7 +38,8 @@ sending messages and commands yourself.
    more than one MeshCore device nearby, or scanning doesn't find yours, run:
 
    ```
-   .venv\Scripts\python.exe scan_ble.py
+   .venv\Scripts\python.exe scan_ble.py     # Windows
+   .venv/bin/python scan_ble.py             # Linux
    ```
 
    to list nearby BLE devices with their name and address, then set
@@ -38,11 +51,21 @@ sending messages and commands yourself.
 
 ## Running
 
-Double-click `run_bot.bat`, or run manually:
+Windows: double-click `run_bot.bat`, or run manually:
 
 ```
 .venv\Scripts\python.exe pingpong_bot.py
 ```
+
+Linux: run `./run_bot.sh`, or manually:
+
+```
+.venv/bin/python pingpong_bot.py
+```
+
+The bot is a persistent foreground process with an interactive prompt, so
+on a headless Linux server run it inside `tmux` or `screen` — that keeps
+the session (and the `>` prompt) alive across an SSH disconnect.
 
 The console will log connection status and every message it sees or
 sends. A `>` prompt at the bottom stays put while log output scrolls
