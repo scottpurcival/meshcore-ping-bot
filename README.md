@@ -1,8 +1,9 @@
 # MeshcoreChatterbot
 
-A small bot that connects to a MeshCore companion radio node over BLE
-and replies `pong` to any private message containing `ping`. All other
-private messages are ignored.
+A small bot that connects to a MeshCore companion radio node over BLE,
+logs private and channel messages it sees, and replies `pong` to any
+private message containing `ping`. It also gives you a live prompt for
+sending messages and commands yourself.
 
 ## Setup
 
@@ -43,5 +44,14 @@ Double-click `run_bot.bat`, or run manually:
 .venv\Scripts\python.exe pingpong_bot.py
 ```
 
-The console will log connection status and every ping it replies to.
-Press Ctrl+C to stop.
+The console will log connection status and every message it sees or
+sends. A `>` prompt at the bottom stays put while log output scrolls
+above it, and accepts:
+
+- `@Name message` — send a private message to a contact, e.g. `@Scoot-Wio hey`
+- `@#channel message` — send to a channel, e.g. `@#test hey all` or `@Public hi`
+- `message` (no `@`) — send to whichever target you last used
+- `/advert` or `/advert flood` — broadcast a self-advertisement
+- `/help` — list commands
+
+Ctrl+C or Ctrl+D to stop.
