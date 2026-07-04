@@ -21,6 +21,7 @@ CHANNEL_PROBE_COUNT = 8
 DEFAULT_AUTO_PONG_INTERVAL = 30
 AUTO_PONG_COUNT = 100
 REPLY_DELAY = 0.5
+PONG_CHANNEL_NAME = "dalby"
 SEND_ATTEMPTS = 3
 SEND_RETRY_DELAY = 0.5
 ACK_TIMEOUT_MULTIPLIER = 3
@@ -285,6 +286,18 @@ async def main():
 
             channel_name = channel_by_idx.get(channel_idx, f"channel {channel_idx}")
             logger.info("[RECV] (#%s): %s (%s%s)", channel_name, text, hops, snr)
+
+            # The firmware has no separate sender-identity field for channel
+            # messages -- it prepends "SenderName: " to the text itself, so
+            # the ping check has to look past that prefix rather than at the
+            # start of the raw text (unlike private messages, which have no
+            # such prefix).
+            _, sep, message = text.partition(": ")
+            message = message if sep else text
+
+            if channel_name.lstrip("#").lower() == PONG_CHANNEL_NAME and message.strip().lower().startswith("ping"):
+                await asyncio.sleep(REPLY_DELAY)
+                await send_channel(meshcore, command_lock, channel_idx, channel_name, "pong")
 
         async def handle_rx_log(event):
             # Fires for every packet the radio hears at all, delivered to us
