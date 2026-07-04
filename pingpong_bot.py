@@ -32,7 +32,8 @@ HELP_TEXT = """Commands:
   /advert [flood]           Broadcast a self-advertisement
   /login <target> <pwd>     Log in to a remote node's admin CLI (e.g. a repeater)
   /cmd <target> <text>      Send an admin CLI command; reply shows as [RECV]
-  /verbose                  Toggle [HEARD] logging of every packet heard (off by default)
+  /verbose                  Toggle on-screen [HEARD] logging of every packet heard (off by
+                            default; always recorded to the log file regardless)
   /help                     Show this help
 """
 
@@ -172,13 +173,22 @@ async def main():
         # at the bottom of the screen instead of being overwritten by it.
         os.makedirs(LOG_DIR, exist_ok=True)
         log_path = os.path.join(LOG_DIR, f"pingpong_{datetime.now():%Y%m%d_%H%M%S}.log")
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
         logging.basicConfig(
             level=logging.INFO,
             format=LOG_FORMAT,
             datefmt=LOG_DATEFMT,
             force=True,
-            handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")],
+            handlers=[stream_handler, file_handler],
         )
+        # Only our own logger goes to DEBUG -- third-party loggers (bleak's BLE
+        # stack in particular) have no explicit level of their own, so they'd
+        # inherit the root's level too and flood the log with GATT/notify
+        # chatter on every (re)connect if root itself were bumped to DEBUG.
+        logger.setLevel(logging.DEBUG)
         logger.info("Logging to %s", log_path)
 
         address = config.get("address") or None
@@ -187,7 +197,9 @@ async def main():
         if address is None:
             logger.info("No address configured, scanning for a MeshCore BLE device...")
 
-        meshcore = await MeshCore.create_ble(address=address, pin=pin)
+        meshcore = await MeshCore.create_ble(
+            address=address, pin=pin, auto_reconnect=True, max_reconnect_attempts=float("inf")
+        )
         if meshcore is None:
             logger.error("Could not connect to companion node over BLE")
             return
@@ -279,11 +291,10 @@ async def main():
             # or not -- including a relay's rebroadcast of someone else's
             # packet. Matching pkt_hash across two [HEARD] lines (one direct,
             # one via a relay's path) confirms that relay actually forwarded
-            # it, which [RECV] alone can't show. Off by default since it's
-            # noisy on a busy mesh -- toggle with /verbose.
-            if not verbose:
-                return
-
+            # it, which [RECV] alone can't show. Always logged at DEBUG so
+            # the file always has it; noisy on a busy mesh, so it's only
+            # shown on screen when /verbose raises the console handler's
+            # level to DEBUG too.
             path = format_path(event.payload.get("path_len"), event.payload.get("path", ""))
             snr = format_snr(event.payload.get("snr"))
             rssi = event.payload.get("rssi")
@@ -292,7 +303,25 @@ async def main():
             pkt_hash = event.payload.get("pkt_hash")
             pkt_str = f" pkt={pkt_hash:08x}" if pkt_hash is not None else ""
 
-            logger.info("[HEARD]%s %s (%s%s%s)", pkt_str, payload_type, path, snr, rssi_str)
+            logger.debug("[HEARD]%s %s (%s%s%s)", pkt_str, payload_type, path, snr, rssi_str)
+
+        async def handle_connected(event):
+            if event.payload.get("reconnected"):
+                logger.info("Reconnected to companion node over BLE")
+            else:
+                logger.info("Connected to companion node over BLE")
+
+        async def handle_disconnected(event):
+            reason = event.payload.get("reason", "unknown")
+            if reason == "manual_disconnect":
+                logger.info("Disconnected from companion node (shutting down)")
+            elif event.payload.get("max_attempts_exceeded"):
+                logger.error(
+                    "Lost connection to companion node (%s) -- reconnect attempts exhausted, giving up",
+                    reason,
+                )
+            else:
+                logger.warning("Lost connection to companion node (%s) -- reconnecting...", reason)
 
         async def handle_input_line(line):
             nonlocal current_target, verbose
@@ -308,7 +337,11 @@ async def main():
                     print(HELP_TEXT)
                 elif cmd == "verbose":
                     verbose = not verbose
-                    logger.info("Verbose [HEARD] logging %s", "enabled" if verbose else "disabled")
+                    stream_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+                    logger.info(
+                        "On-screen [HEARD] logging %s (log file always has it)",
+                        "enabled" if verbose else "disabled",
+                    )
                 elif cmd == "advert":
                     flood = rest.strip().lower() == "flood"
                     async with command_lock:
@@ -377,6 +410,8 @@ async def main():
         dm_subscription = meshcore.subscribe(EventType.CONTACT_MSG_RECV, handle_private_message)
         channel_subscription = meshcore.subscribe(EventType.CHANNEL_MSG_RECV, handle_channel_message)
         rxlog_subscription = meshcore.subscribe(EventType.RX_LOG_DATA, handle_rx_log)
+        connected_subscription = meshcore.subscribe(EventType.CONNECTED, handle_connected)
+        disconnected_subscription = meshcore.subscribe(EventType.DISCONNECTED, handle_disconnected)
         await meshcore.start_auto_message_fetching()
 
         logger.info("Bot is running. Type /help for commands, Ctrl+C to stop.")
@@ -394,6 +429,8 @@ async def main():
             meshcore.unsubscribe(dm_subscription)
             meshcore.unsubscribe(channel_subscription)
             meshcore.unsubscribe(rxlog_subscription)
+            meshcore.unsubscribe(connected_subscription)
+            meshcore.unsubscribe(disconnected_subscription)
             await meshcore.stop_auto_message_fetching()
             await meshcore.disconnect()
             logger.info("Disconnected, bot stopped.")
