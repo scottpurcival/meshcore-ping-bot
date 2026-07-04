@@ -6,6 +6,8 @@ sending messages and commands.
 import asyncio
 import json
 import logging
+import os
+from datetime import datetime
 
 from meshcore import EventType, MeshCore
 from prompt_toolkit import PromptSession
@@ -14,18 +16,24 @@ from prompt_toolkit.patch_stdout import patch_stdout
 CONFIG_PATH = "config.json"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+LOG_DIR = "logs"
 CHANNEL_PROBE_COUNT = 8
 DEFAULT_AUTO_PONG_INTERVAL = 30
 AUTO_PONG_COUNT = 100
+REPLY_DELAY = 0.5
 SEND_ATTEMPTS = 3
 SEND_RETRY_DELAY = 0.5
+ACK_TIMEOUT_MULTIPLIER = 3
 
 HELP_TEXT = """Commands:
-  @Name message        Send a private message to a contact (e.g. @Scoot-Wio hey)
-  @#channel message     Send a message to a channel (e.g. @#test hey all, @Public hi)
-  message               Send to the last-used target, no @ needed
-  /advert [flood]        Broadcast a self-advertisement
-  /help                  Show this help
+  @Name message           Send a private message to a contact (e.g. @Scoot-Wio hey)
+  @#channel message        Send a message to a channel (e.g. @#test hey all, @Public hi)
+  message                  Send to the last-used target, no @ needed
+  /advert [flood]           Broadcast a self-advertisement
+  /login <target> <pwd>     Log in to a remote node's admin CLI (e.g. a repeater)
+  /cmd <target> <text>      Send an admin CLI command; reply shows as [RECV]
+  /verbose                  Toggle [HEARD] logging of every packet heard (off by default)
+  /help                     Show this help
 """
 
 DM_HELP_TEXT = (
@@ -48,40 +56,75 @@ def format_hops(path_len):
     return f"{path_len} hop" + ("" if path_len == 1 else "s")
 
 
-async def send_private(meshcore, lock, dst, label, text, hops=None):
-    # meshcore's send() matches responses by event type only (no per-request
-    # correlation id), and the library's own background auto-fetch loop is
-    # concurrently issuing get_msg() calls the whole time this bot runs. The
-    # two can race: a MSG_SENT/ERROR meant for one call occasionally resolves
-    # the other's waiting future instead, which looks like a send that just
-    # silently fails or times out waiting for an ACK. `lock` serializes our
-    # own outgoing commands to remove self-inflicted collisions, and the
-    # retry loop below absorbs the residual races against the library's
-    # internal polling that we can't otherwise synchronize with.
-    suffix = f" ({hops})" if hops else ""
-    for attempt in range(1, SEND_ATTEMPTS + 1):
-        async with lock:
-            result = await meshcore.commands.send_msg(dst, text)
+def format_snr(snr):
+    return f", SNR {snr:.1f}dB" if snr is not None else ""
 
-        if not result.is_error():
+
+def format_path(path_len, path):
+    if path_len is None:
+        return "unknown path"
+    if path_len == -1:
+        return "flood"
+    if path_len == 0:
+        return "direct"
+    relays = ",".join(path[i:i + 2] for i in range(0, len(path), 2)[:path_len])
+    return f"{path_len} hop" + ("" if path_len == 1 else "s") + f" via {relays}"
+
+
+def resolve_send_path(meshcore, dst):
+    # The contact's own out_path is the real outgoing route, refetched fresh
+    # on every attempt since it can change between retries (e.g. after a
+    # path reset) -- unlike the incoming message's path_len, this isn't a
+    # reused guess.
+    prefix = dst.get("public_key", "")[:12] if isinstance(dst, dict) else dst
+    contact = meshcore.get_contact_by_key_prefix(prefix)
+    if contact is None:
+        return "unknown path"
+    return format_path(contact.get("out_path_len"), contact.get("out_path", ""))
+
+
+async def send_private(meshcore, lock, dst, label, text):
+    # `lock` serializes our own outgoing commands, since meshcore's send()
+    # matches responses by event type only (no per-request correlation id)
+    # and could in principle cross-wire two of our own concurrent requests.
+    # The bigger factor in practice: contacts routed via a relay (out_path_len
+    # > 0) can take longer for a delivery ACK to round-trip than the device's
+    # own `suggested_timeout` accounts for, so we wait a multiple of it below
+    # rather than trusting it as a hard cutoff -- see the "no ACK" debugging
+    # session in git history for how this was diagnosed.
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        # Encode the retry number into the actual transmitted text (not just
+        # our own log) so the recipient can tell which attempt got through.
+        send_text = text if attempt == 1 else f"{text} (retry {attempt - 1})"
+        path = resolve_send_path(meshcore, dst)
+
+        async with lock:
+            result = await meshcore.commands.send_msg(dst, send_text)
+
+        if result.is_error():
+            logger.error("[SENT] (%s) %s -- failed to queue: %s", label, send_text, result.payload)
+        else:
+            logger.info("[SENT] (%s) %s (%s)", label, send_text, path)
             expected_ack = result.payload["expected_ack"].hex()
-            timeout = result.payload["suggested_timeout"] / 1000
+            ack_timeout = result.payload["suggested_timeout"] / 1000 * ACK_TIMEOUT_MULTIPLIER
             ack = await meshcore.wait_for_event(
-                EventType.ACK, attribute_filters={"code": expected_ack}, timeout=timeout
+                EventType.ACK, attribute_filters={"code": expected_ack}, timeout=ack_timeout
             )
             if ack is not None:
-                # The ACK packet itself carries no hop count, so callers
-                # that pass `hops` are reusing the hop count of the message
-                # being replied to as an estimate of the return path length.
-                logger.info("[SENT] (%s) %s -- ACKed%s", label, text, suffix)
+                logger.info("[ACK] (%s) %s -- delivered (%s)", label, send_text, path)
                 return
+            logger.warning(
+                "[ACK] (%s) %s -- no ACK after %.0fs (%s)", label, send_text, ack_timeout, path
+            )
 
         if attempt < SEND_ATTEMPTS:
+            logger.info(
+                "[SENT] (%s) %s -- retrying (attempt %d/%d)", label, send_text, attempt + 1, SEND_ATTEMPTS
+            )
             await asyncio.sleep(SEND_RETRY_DELAY)
 
     logger.warning(
-        "[SENT] (%s) %s -- no ACK after %d attempt(s), may not have arrived%s",
-        label, text, SEND_ATTEMPTS, suffix,
+        "[SENT] (%s) %s -- giving up after %d attempt(s) (%s)", label, send_text, SEND_ATTEMPTS, path
     )
 
 
@@ -124,12 +167,19 @@ async def main():
     config = load_config()
 
     with patch_stdout():
-        # (Re)configured here, after patch_stdout is active, so log output
-        # is routed through the same proxy that keeps the prompt line at
-        # the bottom of the screen instead of being overwritten by it.
+        # (Re)configured here, after patch_stdout is active, so console log
+        # output is routed through the same proxy that keeps the prompt line
+        # at the bottom of the screen instead of being overwritten by it.
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"pingpong_{datetime.now():%Y%m%d_%H%M%S}.log")
         logging.basicConfig(
-            level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT, force=True
+            level=logging.INFO,
+            format=LOG_FORMAT,
+            datefmt=LOG_DATEFMT,
+            force=True,
+            handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")],
         )
+        logger.info("Logging to %s", log_path)
 
         address = config.get("address") or None
         pin = config.get("pin") or None
@@ -162,15 +212,24 @@ async def main():
 
         current_target = None
         auto_pong_tasks = {}
+        verbose = False
 
         async def handle_private_message(event):
             text = event.payload.get("text", "")
             pubkey_prefix = event.payload.get("pubkey_prefix")
             hops = format_hops(event.payload.get("path_len"))
+            snr = format_snr(event.payload.get("SNR"))
 
             contact = meshcore.get_contact_by_key_prefix(pubkey_prefix)
             sender = contact.get("adv_name") if contact else pubkey_prefix
-            logger.info("[RECV] (%s): %s (%s)", sender, text, hops)
+            logger.info("[RECV] (%s): %s (%s%s)", sender, text, hops, snr)
+
+            # Receiving a private message that requested delivery confirmation
+            # makes the companion's own firmware queue an outgoing ack for it.
+            # Replying instantly asks the radio to also queue our own new
+            # message at almost the same moment -- this gives the firmware's
+            # ack a head start so the two don't contend for the same TX slot.
+            await asyncio.sleep(REPLY_DELAY)
 
             parts = text.strip().split()
             command = parts[0].lower() if parts else ""
@@ -203,19 +262,40 @@ async def main():
                 task = auto_pong_tasks.pop(pubkey_prefix, None)
                 if task:
                     task.cancel()
-            elif "ping" in text.lower():
-                await send_private(meshcore, command_lock, pubkey_prefix, sender, "pong", hops=hops)
+            elif text.lower().startswith("ping"):
+                await send_private(meshcore, command_lock, pubkey_prefix, sender, "pong")
 
         async def handle_channel_message(event):
             text = event.payload.get("text", "")
             channel_idx = event.payload.get("channel_idx")
             hops = format_hops(event.payload.get("path_len"))
+            snr = format_snr(event.payload.get("SNR"))
 
             channel_name = channel_by_idx.get(channel_idx, f"channel {channel_idx}")
-            logger.info("[RECV] (#%s): %s (%s)", channel_name, text, hops)
+            logger.info("[RECV] (#%s): %s (%s%s)", channel_name, text, hops, snr)
+
+        async def handle_rx_log(event):
+            # Fires for every packet the radio hears at all, delivered to us
+            # or not -- including a relay's rebroadcast of someone else's
+            # packet. Matching pkt_hash across two [HEARD] lines (one direct,
+            # one via a relay's path) confirms that relay actually forwarded
+            # it, which [RECV] alone can't show. Off by default since it's
+            # noisy on a busy mesh -- toggle with /verbose.
+            if not verbose:
+                return
+
+            path = format_path(event.payload.get("path_len"), event.payload.get("path", ""))
+            snr = format_snr(event.payload.get("snr"))
+            rssi = event.payload.get("rssi")
+            rssi_str = f", RSSI {rssi}dBm" if rssi is not None else ""
+            payload_type = event.payload.get("payload_typename", "?")
+            pkt_hash = event.payload.get("pkt_hash")
+            pkt_str = f" pkt={pkt_hash:08x}" if pkt_hash is not None else ""
+
+            logger.info("[HEARD]%s %s (%s%s%s)", pkt_str, payload_type, path, snr, rssi_str)
 
         async def handle_input_line(line):
-            nonlocal current_target
+            nonlocal current_target, verbose
 
             line = line.strip()
             if not line:
@@ -226,6 +306,9 @@ async def main():
                 cmd = cmd.lower()
                 if cmd == "help":
                     print(HELP_TEXT)
+                elif cmd == "verbose":
+                    verbose = not verbose
+                    logger.info("Verbose [HEARD] logging %s", "enabled" if verbose else "disabled")
                 elif cmd == "advert":
                     flood = rest.strip().lower() == "flood"
                     async with command_lock:
@@ -234,6 +317,35 @@ async def main():
                         logger.error("/advert failed: %s", result.payload)
                     else:
                         logger.info("Advert sent%s", " (flood)" if flood else "")
+                elif cmd == "login":
+                    target_str, _, password = rest.partition(" ")
+                    resolved = resolve_target(meshcore, channel_by_name, target_str)
+                    if resolved is None or resolved[0] != "contact":
+                        print(f"Unknown contact: {target_str}")
+                        return
+                    contact = resolved[1]
+                    async with command_lock:
+                        result = await meshcore.commands.send_login_sync(contact, password)
+                    if result is None:
+                        logger.warning("Login to %s failed or timed out", resolved[2])
+                    else:
+                        logger.info("Logged in to %s", resolved[2])
+                elif cmd == "cmd":
+                    target_str, _, admin_cmd = rest.partition(" ")
+                    if not admin_cmd:
+                        print("Usage: /cmd <target> <admin command text>")
+                        return
+                    resolved = resolve_target(meshcore, channel_by_name, target_str)
+                    if resolved is None or resolved[0] != "contact":
+                        print(f"Unknown contact: {target_str}")
+                        return
+                    contact = resolved[1]
+                    async with command_lock:
+                        result = await meshcore.commands.send_cmd(contact, admin_cmd)
+                    if result.is_error():
+                        logger.error("/cmd to %s failed: %s", resolved[2], result.payload)
+                    else:
+                        logger.info("Sent admin command to %s -- reply will appear as [RECV]", resolved[2])
                 else:
                     print(f"Unknown command: /{cmd}. Type /help for a list.")
                 return
@@ -264,6 +376,7 @@ async def main():
 
         dm_subscription = meshcore.subscribe(EventType.CONTACT_MSG_RECV, handle_private_message)
         channel_subscription = meshcore.subscribe(EventType.CHANNEL_MSG_RECV, handle_channel_message)
+        rxlog_subscription = meshcore.subscribe(EventType.RX_LOG_DATA, handle_rx_log)
         await meshcore.start_auto_message_fetching()
 
         logger.info("Bot is running. Type /help for commands, Ctrl+C to stop.")
@@ -280,6 +393,7 @@ async def main():
                 task.cancel()
             meshcore.unsubscribe(dm_subscription)
             meshcore.unsubscribe(channel_subscription)
+            meshcore.unsubscribe(rxlog_subscription)
             await meshcore.stop_auto_message_fetching()
             await meshcore.disconnect()
             logger.info("Disconnected, bot stopped.")

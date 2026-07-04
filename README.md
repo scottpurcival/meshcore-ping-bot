@@ -52,6 +52,13 @@ above it, and accepts:
 - `@#channel message` — send to a channel, e.g. `@#test hey all` or `@Public hi`
 - `message` (no `@`) — send to whichever target you last used
 - `/advert` or `/advert flood` — broadcast a self-advertisement
+- `/login <target> <password>` — log in to a remote node's admin CLI (e.g. a repeater)
+- `/cmd <target> <text>` — send an admin CLI command; the reply shows up as a normal `[RECV]` line
+- `/verbose` — toggle `[HEARD]` logging of every packet the radio hears (off by default since it can get noisy)
 - `/help` — list commands
 
 Ctrl+C or Ctrl+D to stop.
+
+Every run also writes the same log output to a timestamped file under
+`logs/` (e.g. `logs/pingpong_20260704_142447.log`), gitignored, so you
+have a permanent record to review afterward.
